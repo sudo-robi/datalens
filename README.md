@@ -160,8 +160,12 @@ datalens/
 ├── spark-jobs/            # PySpark analytics
 ├── deploy/                # Cloud Run deployment configs
 │   ├── cloud-run.sh       # Interactive deploy script
-│   └── cloudbuild.yaml    # CI/CD pipeline
-├── docker-compose.yml     # PostgreSQL + Elasticsearch
+│   └── cloudbuild.yaml    # GCP CI/CD pipeline
+├── .github/workflows/     # GitHub Actions CI
+│   └── ci.yml             # Tests + Docker build
+├── docker-compose.yml     # Dev infrastructure (PostgreSQL + Elasticsearch)
+├── docker-compose.prod.yml# Full production stack
+├── .env.example           # Environment variable template
 └── README.md
 ```
 
@@ -199,82 +203,48 @@ Every service uses multi-stage builds: a build stage with the full SDK (JDK, Go,
 
 Tailwind gives us complete control over the visual design without fighting a library's opinionated defaults. For a portfolio project, this matters — the UI needs to look intentional, not like every other Bootstrap/Material app. The utility-first approach also means the CSS bundle is small (purged unused classes) and there's no component library version to maintain.
 
-## Deployment (Google Cloud Run)
+## Deployment
 
-### Prerequisites
-- Google Cloud account with billing enabled
-- `gcloud` CLI installed and authenticated (`gcloud auth login`)
-- Cloud SQL (PostgreSQL) and Elasticsearch instances provisioned
-
-### Quick Deploy
+### Docker Compose (Production)
 
 ```bash
-# Set your GCP project
-export PROJECT_ID=your-gcp-project-id
+cp .env.example .env        # Edit with real credentials
+docker compose -f docker-compose.prod.yml up -d --build
+```
 
-# Run the deployment script
+This starts all 5 services: API Gateway, Ingestion Service, Frontend, PostgreSQL, and Elasticsearch.
+
+### Google Cloud Run
+
+```bash
+export PROJECT_ID=your-gcp-project-id
 ./deploy/cloud-run.sh
 ```
 
-The script will prompt for:
-- Cloud SQL connection name (optional — for Cloud SQL Proxy)
-- PostgreSQL connection string
-- Elasticsearch URL
-- JWT signing secret
+### CI/CD (GitHub Actions)
 
-### Architecture on Cloud Run
+Workflows run on every push to `main`:
 
-- **API Gateway** → Cloud Run (auto-scales to 0, free tier covers idle)
-- **Ingestion Service** → Cloud Run
-- **Frontend** → Cloud Run + Nginx
-- **PostgreSQL** → Cloud SQL (or free-tier Supabase/Neon)
-- **Elasticsearch** → Elastic Cloud free trial or self-hosted
+1. **Java tests** — JUnit 5 + JaCoCo coverage
+2. **Go tests** — `go test` with coverage
+3. **Frontend tests** — Vitest with coverage
+4. **Build & push Docker images** — to Google Container Registry (main branch only)
+
+Requires secrets: `GCP_PROJECT_ID`, plus GCP credentials for image push.
 
 ### Cost Estimate (Free Tier)
 
 | Service | Free Tier | Cost |
 |---------|-----------|------|
 | Cloud Run | 240,000 vCPU-seconds/month | $0 (idle + light usage) |
-| Cloud SQL | db-f1-micro instance | ~$7.67/month |
-| Alternative | Supabase / Neon (free PostgreSQL) | $0 |
-
-### CI/CD with Cloud Build
-
-```bash
-# Trigger a build manually
-gcloud builds submit --config deploy/cloudbuild.yaml .
-
-# Or set up a trigger on the main branch
-gcloud builds triggers create github \
-  --repo-name=datalens \
-  --repo-owner=your-github-user \
-  --branch-pattern=^main$ \
-  --build-config=deploy/cloudbuild.yaml
-```
-
-### Manual Service Management
-
-```bash
-# List running services
-gcloud run services list --region=us-central1
-
-# View logs
-gcloud logs read --service=datalens-api-gateway --limit=50
-
-# Update a single service
-gcloud run deploy datalens-api-gateway \
-  --image=gcr.io/$PROJECT_ID/datalens-api-gateway:latest \
-  --region=us-central1
-
-# Delete a service
-gcloud run services delete datalens-frontend --region=us-central1
-```
+| Docker Compose | Self-hosted | $0 |
+| Cloud SQL (alt) | db-f1-micro instance | ~$7.67/month |
 
 ## Future Improvements
 
 - [ ] WebSocket streaming for real-time data updates
 - [ ] Cassandra for time-series event storage
 - [ ] Spark ML for anomaly detection
-- [x] ~~AWS deployment (ECS Fargate + S3)~~ → Deployed to Google Cloud Run
-- [x] ~~CI/CD with GitHub Actions~~ → Cloud Build pipeline in `deploy/cloudbuild.yaml`
+- [x] ~~AWS deployment (ECS Fargate + S3)~~ → Docker Compose prod + Cloud Run
+- [x] ~~CI/CD with GitHub Actions~~ → `.github/workflows/ci.yml`
 - [ ] Data visualization dashboard with D3.js

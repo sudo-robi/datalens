@@ -1,0 +1,85 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  java-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+      - name: Build and test API Gateway
+        working-directory: api-gateway
+        run: |
+          chmod +x gradlew
+          ./gradlew test jacocoTestReport
+
+      - name: Upload Java coverage
+        uses: actions/upload-artifact@v4
+        with:
+          name: java-coverage
+          path: api-gateway/build/reports/jacoco/test/html/
+
+  go-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+      - name: Run Go tests
+        working-directory: ingestion-service
+        run: go test -coverprofile=coverage.out -covermode=atomic ./...
+
+      - name: Upload Go coverage
+        uses: actions/upload-artifact@v4
+        with:
+          name: go-coverage
+          path: ingestion-service/coverage.out
+
+  frontend-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - name: Install and test frontend
+        working-directory: frontend
+        run: |
+          npm ci
+          npx vitest run --coverage
+
+  build-images:
+    needs: [java-tests, go-tests, frontend-tests]
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure Docker
+        run: gcloud auth configure-docker --quiet
+
+      - name: Build and push API Gateway
+        run: |
+          docker build -t gcr.io/${{ secrets.GCP_PROJECT_ID }}/datalens-api-gateway:${{ github.sha }} api-gateway/
+          docker push gcr.io/${{ secrets.GCP_PROJECT_ID }}/datalens-api-gateway:${{ github.sha }}
+
+      - name: Build and push Ingestion Service
+        run: |
+          docker build -t gcr.io/${{ secrets.GCP_PROJECT_ID }}/datalens-ingestion-service:${{ github.sha }} ingestion-service/
+          docker push gcr.io/${{ secrets.GCP_PROJECT_ID }}/datalens-ingestion-service:${{ github.sha }}
+
+      - name: Build and push Frontend
+        run: |
+          docker build -t gcr.io/${{ secrets.GCP_PROJECT_ID }}/datalens-frontend:${{ github.sha }} frontend/
+          docker push gcr.io/${{ secrets.GCP_PROJECT_ID }}/datalens-frontend:${{ github.sha }}
