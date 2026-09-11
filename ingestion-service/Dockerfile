@@ -1,5 +1,5 @@
 # Multi-stage build for Go ingestion service
-FROM golang:1.22-alpine AS build
+FROM golang:1.24-alpine AS build
 
 # Install ca-certificates and git for fetching dependencies
 RUN apk add --no-cache ca-certificates git
@@ -16,7 +16,7 @@ RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
     go build -ldflags="-s -w" -o server .
 
 # Production image — minimal attack surface
-FROM alpine:3.19
+FROM alpine:3.21
 RUN apk --no-cache add ca-certificates tzdata \
     && addgroup -S app && adduser -S app -G app
 
