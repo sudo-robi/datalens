@@ -57,6 +57,7 @@ jobs:
     needs: [java-tests, go-tests, frontend-tests]
     runs-on: ubuntu-latest
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    continue-on-error: true
     permissions:
       contents: read
       id-token: write
