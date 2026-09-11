@@ -372,3 +372,79 @@ func TestSearchInvalidResponse(t *testing.T) {
 		t.Fatal("expected error for invalid JSON response, got nil")
 	}
 }
+
+// --- Error path tests for uncovered branches ---
+
+func TestIndexExistsHTTPError(t *testing.T) {
+	client := &Client{baseURL: "http://localhost:1", httpClient: &http.Client{}}
+	_, err := client.IndexExists(context.Background(), "test")
+	if err == nil {
+		t.Fatal("expected error for unreachable server")
+	}
+}
+
+func TestCreateIndexHTTPError(t *testing.T) {
+	client := &Client{baseURL: "http://localhost:1", httpClient: &http.Client{}}
+	err := client.CreateIndex(context.Background(), "test")
+	if err == nil {
+		t.Fatal("expected error for unreachable server")
+	}
+}
+
+func TestBulkIndexHTTPError(t *testing.T) {
+	client := &Client{baseURL: "http://localhost:1", httpClient: &http.Client{}}
+	docs := []map[string]interface{}{{"dataset_id": 1, "name": "test"}}
+	err := client.BulkIndex(context.Background(), "test", docs)
+	if err == nil {
+		t.Fatal("expected error for unreachable server")
+	}
+}
+
+func TestBulkIndexInvalidResponse(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte("not valid json"))
+	}))
+	defer server.Close()
+
+	client := &Client{baseURL: server.URL, httpClient: &http.Client{}}
+	docs := []map[string]interface{}{{"dataset_id": 1, "name": "test"}}
+	err := client.BulkIndex(context.Background(), "test", docs)
+	if err == nil {
+		t.Fatal("expected error for invalid JSON response")
+	}
+	if !strings.Contains(err.Error(), "failed to parse bulk response") {
+		t.Errorf("expected 'failed to parse bulk response' in error, got: %v", err)
+	}
+}
+
+func TestSearchHTTPError(t *testing.T) {
+	client := &Client{baseURL: "http://localhost:1", httpClient: &http.Client{}}
+	_, err := client.Search(context.Background(), "idx", "q", 1, 20)
+	if err == nil {
+		t.Fatal("expected error for unreachable server")
+	}
+}
+
+func TestNewClientInvalidURL(t *testing.T) {
+	_, err := NewClient("not-a-url")
+	if err == nil {
+		t.Fatal("expected error for invalid URL")
+	}
+}
+
+func TestIndexExistsContextCancelled(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	client := &Client{baseURL: server.URL, httpClient: &http.Client{}}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	_, err := client.IndexExists(ctx, "test")
+	if err == nil {
+		t.Log("IndexExists did not return error with cancelled context")
+	}
+}

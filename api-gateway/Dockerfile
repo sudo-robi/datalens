@@ -1,4 +1,5 @@
 FROM eclipse-temurin:21-jdk AS build
+RUN apt-get update && apt-get install -y unzip && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 COPY gradle/ gradle/
 COPY gradlew build.gradle settings.gradle ./

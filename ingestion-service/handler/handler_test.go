@@ -2,13 +2,92 @@ package handler
 
 import (
 	"bytes"
+	"database/sql"
+	"database/sql/driver"
 	"encoding/json"
+	"fmt"
 	"io"
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
+	"strings"
 	"testing"
+	"unsafe"
+
+	"github.com/datalens/ingestion-service/elasticsearch"
+	"github.com/datalens/ingestion-service/postgres"
 )
+
+// --- Test driver for mock database ---
+
+type handlerTestDriver struct{}
+
+func init() {
+	sql.Register("handlertestdrv", &handlerTestDriver{})
+}
+
+func (d *handlerTestDriver) Open(name string) (driver.Conn, error) {
+	return &handlerTestConn{}, nil
+}
+
+type handlerTestConn struct{}
+
+func (c *handlerTestConn) Prepare(query string) (driver.Stmt, error) { return nil, driver.ErrSkip }
+func (c *handlerTestConn) Close() error                             { return nil }
+func (c *handlerTestConn) Begin() (driver.Tx, error)                { return nil, driver.ErrSkip }
+func (c *handlerTestConn) Exec(query string, args []driver.Value) (driver.Result, error) {
+	return &handlerTestResult{}, nil
+}
+func (c *handlerTestConn) Query(query string, args []driver.Value) (driver.Rows, error) {
+	return nil, driver.ErrSkip
+}
+
+type handlerTestResult struct{}
+
+func (r *handlerTestResult) LastInsertId() (int64, error) { return 0, nil }
+func (r *handlerTestResult) RowsAffected() (int64, error) { return 0, nil }
+
+// createTestPGClient creates a postgres.Client with a mock sql.DB via reflect.
+func createTestPGClient() *postgres.Client {
+	db, _ := sql.Open("handlertestdrv", "")
+	v := reflect.New(reflect.TypeOf(postgres.Client{}))
+	f := v.Elem().FieldByName("db")
+	reflect.NewAt(f.Type(), unsafe.Pointer(f.UnsafeAddr())).Elem().Set(reflect.ValueOf(db))
+	return v.Interface().(*postgres.Client)
+}
+
+// newMockESServer creates an httptest.Server that mimics Elasticsearch.
+func newMockESServer(t *testing.T, indexExists bool) *httptest.Server {
+	t.Helper()
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		path := r.URL.Path
+		switch {
+		case path == "/_cluster/health":
+			json.NewEncoder(w).Encode(map[string]string{"status": "green"})
+		case r.Method == "HEAD":
+			if indexExists {
+				w.WriteHeader(http.StatusOK)
+			} else {
+				w.WriteHeader(http.StatusNotFound)
+			}
+		case r.Method == "PUT":
+			w.WriteHeader(http.StatusOK)
+		case r.Method == "POST" && path == "/_bulk":
+			json.NewEncoder(w).Encode(map[string]interface{}{"errors": false})
+		case r.Method == "POST" && strings.HasSuffix(path, "/_search"):
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"hits": map[string]interface{}{
+					"total": map[string]interface{}{"value": 0},
+					"hits":  []interface{}{},
+				},
+			})
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+}
 
 // --- Mock Elasticsearch ---
 
@@ -339,32 +418,21 @@ func TestSearchEmptyBody(t *testing.T) {
 	}
 }
 
-func TestSearchDefaultValues(t *testing.T) {
-	// The handler's Search method calls es.Search and db methods directly,
-	// which require concrete types. We can't mock them without interfaces.
-	// Instead, verify that the request parsing and defaults logic works
-	// by testing with a valid JSON body (the handler will panic on nil es,
-	// so we only test the decode path via TestSearchInvalidJSON above).
-
-	// This test verifies that a valid body with defaults is accepted by the decoder.
+func TestSearchDefaultValuesNilHandler(t *testing.T) {
+	// Verify that a valid body with defaults is accepted by the decoder.
 	h := &Handler{}
 
 	body := `{"query": "test"}`
 	req := httptest.NewRequest("POST", "/search", bytes.NewBufferString(body))
 	w := httptest.NewRecorder()
 
-	// The Search method will panic because es is nil. We catch that panic
-	// and verify the request was decoded correctly.
 	defer func() {
 		if r := recover(); r != nil {
 			// Expected: nil pointer dereference because es is nil.
-			// This confirms the JSON was decoded and defaults were applied
-			// before the method tried to use the nil es client.
 		}
 	}()
 
 	h.Search(w, req)
-	// If we get here without panic, the handler parsed the body correctly.
 }
 
 func TestIngestCSVNoFile(t *testing.T) {
@@ -461,5 +529,404 @@ func TestIngestCSVNoDatasetID(t *testing.T) {
 	resp := w.Result()
 	if resp.StatusCode != http.StatusBadRequest {
 		t.Errorf("expected status 400, got %d", resp.StatusCode)
+	}
+}
+
+func TestNewHandler(t *testing.T) {
+	h := NewHandler(nil, nil)
+	if h == nil {
+		t.Fatal("expected non-nil Handler")
+	}
+	if h.db != nil {
+		t.Error("expected nil db")
+	}
+	if h.es != nil {
+		t.Error("expected nil es")
+	}
+
+	pgClient := createTestPGClient()
+	defer pgClient.Close()
+
+	mockES := newMockESServer(t, false)
+	defer mockES.Close()
+
+	esClient, err := elasticsearch.NewClient(mockES.URL)
+	if err != nil {
+		t.Fatalf("failed to create ES client: %v", err)
+	}
+
+	h2 := NewHandler(pgClient, esClient)
+	if h2 == nil {
+		t.Fatal("expected non-nil Handler with real deps")
+	}
+}
+
+func TestIngestCSVSuccess(t *testing.T) {
+	mockES := newMockESServer(t, false)
+	defer mockES.Close()
+
+	esClient, err := elasticsearch.NewClient(mockES.URL)
+	if err != nil {
+		t.Fatalf("failed to create ES client: %v", err)
+	}
+
+	pgClient := createTestPGClient()
+	defer pgClient.Close()
+
+	h := NewHandler(pgClient, esClient)
+
+	var buf bytes.Buffer
+	writer := multipart.NewWriter(&buf)
+	writer.WriteField("dataset_id", "42")
+	part, _ := writer.CreateFormFile("file", "test.csv")
+	part.Write([]byte("name,age,city\nAlice,30,NYC\nBob,25,LA\n"))
+	writer.Close()
+
+	req := httptest.NewRequest("POST", "/ingest", &buf)
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+	w := httptest.NewRecorder()
+
+	h.IngestCSV(w, req)
+
+	resp := w.Result()
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("expected status 200, got %d", resp.StatusCode)
+	}
+
+	var body APIResponse
+	json.NewDecoder(resp.Body).Decode(&body)
+	if !body.Success {
+		t.Error("expected success=true")
+	}
+
+	data, ok := body.Data.(map[string]interface{})
+	if !ok {
+		t.Fatalf("expected data to be a map, got %T", body.Data)
+	}
+
+	if data["rows_ingested"] != float64(2) {
+		t.Errorf("expected rows_ingested=2, got %v", data["rows_ingested"])
+	}
+	if data["index"] != "dataset_42" {
+		t.Errorf("expected index='dataset_42', got %v", data["index"])
+	}
+	if data["filename"] != "test.csv" {
+		t.Errorf("expected filename='test.csv', got %v", data["filename"])
+	}
+}
+
+func TestIngestCSVIndexAlreadyExists(t *testing.T) {
+	mockES := newMockESServer(t, true)
+	defer mockES.Close()
+
+	esClient, err := elasticsearch.NewClient(mockES.URL)
+	if err != nil {
+		t.Fatalf("failed to create ES client: %v", err)
+	}
+
+	pgClient := createTestPGClient()
+	defer pgClient.Close()
+
+	h := NewHandler(pgClient, esClient)
+
+	var buf bytes.Buffer
+	writer := multipart.NewWriter(&buf)
+	writer.WriteField("dataset_id", "1")
+	part, _ := writer.CreateFormFile("file", "data.csv")
+	part.Write([]byte("col1,col2\nval1,val2\n"))
+	writer.Close()
+
+	req := httptest.NewRequest("POST", "/ingest", &buf)
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+	w := httptest.NewRecorder()
+
+	h.IngestCSV(w, req)
+
+	resp := w.Result()
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("expected status 200, got %d", resp.StatusCode)
+	}
+
+	var body APIResponse
+	json.NewDecoder(resp.Body).Decode(&body)
+	if !body.Success {
+		t.Error("expected success=true")
+	}
+}
+
+func TestIngestCSVLargeBatch(t *testing.T) {
+	mockES := newMockESServer(t, false)
+	defer mockES.Close()
+
+	esClient, err := elasticsearch.NewClient(mockES.URL)
+	if err != nil {
+		t.Fatalf("failed to create ES client: %v", err)
+	}
+
+	pgClient := createTestPGClient()
+	defer pgClient.Close()
+
+	h := NewHandler(pgClient, esClient)
+
+	csvData := "id,value\n"
+	for i := 0; i < 150; i++ {
+		csvData += fmt.Sprintf("%d,item%d\n", i, i)
+	}
+
+	var buf bytes.Buffer
+	writer := multipart.NewWriter(&buf)
+	writer.WriteField("dataset_id", "5")
+	part, _ := writer.CreateFormFile("file", "large.csv")
+	part.Write([]byte(csvData))
+	writer.Close()
+
+	req := httptest.NewRequest("POST", "/ingest", &buf)
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+	w := httptest.NewRecorder()
+
+	h.IngestCSV(w, req)
+
+	resp := w.Result()
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("expected status 200, got %d", resp.StatusCode)
+	}
+
+	var body APIResponse
+	json.NewDecoder(resp.Body).Decode(&body)
+	data := body.Data.(map[string]interface{})
+	if data["rows_ingested"] != float64(150) {
+		t.Errorf("expected rows_ingested=150, got %v", data["rows_ingested"])
+	}
+}
+
+func TestIngestCSVWithEmptyRows(t *testing.T) {
+	mockES := newMockESServer(t, false)
+	defer mockES.Close()
+
+	esClient, err := elasticsearch.NewClient(mockES.URL)
+	if err != nil {
+		t.Fatalf("failed to create ES client: %v", err)
+	}
+
+	pgClient := createTestPGClient()
+	defer pgClient.Close()
+
+	h := NewHandler(pgClient, esClient)
+
+	csvData := "name,age\nAlice,30\n\nBob,25\n\n"
+
+	var buf bytes.Buffer
+	writer := multipart.NewWriter(&buf)
+	writer.WriteField("dataset_id", "10")
+	part, _ := writer.CreateFormFile("file", "empty_rows.csv")
+	part.Write([]byte(csvData))
+	writer.Close()
+
+	req := httptest.NewRequest("POST", "/ingest", &buf)
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+	w := httptest.NewRecorder()
+
+	h.IngestCSV(w, req)
+
+	resp := w.Result()
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("expected status 200, got %d", resp.StatusCode)
+	}
+}
+
+func TestSearchDefaultValues(t *testing.T) {
+	mockES := newMockESServer(t, false)
+	defer mockES.Close()
+
+	esClient, err := elasticsearch.NewClient(mockES.URL)
+	if err != nil {
+		t.Fatalf("failed to create ES client: %v", err)
+	}
+
+	h := NewHandler(nil, esClient)
+
+	body := `{"query": "test"}`
+	req := httptest.NewRequest("POST", "/search", bytes.NewBufferString(body))
+	w := httptest.NewRecorder()
+
+	h.Search(w, req)
+
+	resp := w.Result()
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("expected status 200, got %d", resp.StatusCode)
+	}
+
+	var apiResp APIResponse
+	json.NewDecoder(resp.Body).Decode(&apiResp)
+	if !apiResp.Success {
+		t.Error("expected success=true")
+	}
+}
+
+func TestIngestCSVIndexCheckError(t *testing.T) {
+	// Start server and create client, then close server so requests fail
+	mockES := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{"status": "green"})
+	}))
+
+	esClient, err := elasticsearch.NewClient(mockES.URL)
+	if err != nil {
+		t.Fatalf("failed to create ES client: %v", err)
+	}
+	mockES.Close() // Close so subsequent requests fail
+
+	pgClient := createTestPGClient()
+	defer pgClient.Close()
+
+	h := NewHandler(pgClient, esClient)
+
+	var buf bytes.Buffer
+	writer := multipart.NewWriter(&buf)
+	writer.WriteField("dataset_id", "1")
+	part, _ := writer.CreateFormFile("file", "test.csv")
+	part.Write([]byte("name,age\nAlice,30\n"))
+	writer.Close()
+
+	req := httptest.NewRequest("POST", "/ingest", &buf)
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+	w := httptest.NewRecorder()
+
+	h.IngestCSV(w, req)
+
+	resp := w.Result()
+	if resp.StatusCode != http.StatusInternalServerError {
+		t.Errorf("expected status 500, got %d", resp.StatusCode)
+	}
+
+	var body APIResponse
+	json.NewDecoder(resp.Body).Decode(&body)
+	if body.Error != "Failed to check index" {
+		t.Errorf("expected error 'Failed to check index', got %s", body.Error)
+	}
+}
+
+func TestIngestCSVCreateIndexError(t *testing.T) {
+	mockES := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		path := r.URL.Path
+		switch {
+		case path == "/_cluster/health":
+			json.NewEncoder(w).Encode(map[string]string{"status": "green"})
+		case r.Method == "HEAD":
+			w.WriteHeader(http.StatusNotFound) // index doesn't exist
+		case r.Method == "PUT":
+			w.WriteHeader(http.StatusInternalServerError) // create fails
+		default:
+			w.WriteHeader(http.StatusOK)
+		}
+	}))
+	defer mockES.Close()
+
+	esClient, err := elasticsearch.NewClient(mockES.URL)
+	if err != nil {
+		t.Fatalf("failed to create ES client: %v", err)
+	}
+
+	pgClient := createTestPGClient()
+	defer pgClient.Close()
+
+	h := NewHandler(pgClient, esClient)
+
+	var buf bytes.Buffer
+	writer := multipart.NewWriter(&buf)
+	writer.WriteField("dataset_id", "1")
+	part, _ := writer.CreateFormFile("file", "test.csv")
+	part.Write([]byte("name,age\nAlice,30\n"))
+	writer.Close()
+
+	req := httptest.NewRequest("POST", "/ingest", &buf)
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+	w := httptest.NewRecorder()
+
+	h.IngestCSV(w, req)
+
+	resp := w.Result()
+	if resp.StatusCode != http.StatusInternalServerError {
+		t.Errorf("expected status 500, got %d", resp.StatusCode)
+	}
+
+	var body APIResponse
+	json.NewDecoder(resp.Body).Decode(&body)
+	if body.Error != "Failed to create index" {
+		t.Errorf("expected error 'Failed to create index', got %s", body.Error)
+	}
+}
+
+func TestSearchESError(t *testing.T) {
+	// Server returns invalid JSON for search
+	mockES := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Path == "/_cluster/health" {
+			json.NewEncoder(w).Encode(map[string]string{"status": "green"})
+			return
+		}
+		// Return invalid JSON for search
+		w.Write([]byte("not valid json"))
+	}))
+	defer mockES.Close()
+
+	esClient, err := elasticsearch.NewClient(mockES.URL)
+	if err != nil {
+		t.Fatalf("failed to create ES client: %v", err)
+	}
+
+	h := NewHandler(nil, esClient)
+
+	body := `{"query": "test", "index": "test_index"}`
+	req := httptest.NewRequest("POST", "/search", bytes.NewBufferString(body))
+	w := httptest.NewRecorder()
+
+	h.Search(w, req)
+
+	resp := w.Result()
+	if resp.StatusCode != http.StatusInternalServerError {
+		t.Errorf("expected status 500, got %d", resp.StatusCode)
+	}
+
+	var apiResp APIResponse
+	json.NewDecoder(resp.Body).Decode(&apiResp)
+	if apiResp.Error != "Search failed" {
+		t.Errorf("expected error 'Search failed', got %s", apiResp.Error)
+	}
+}
+
+func TestSearchWithCustomValues(t *testing.T) {
+	mockES := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Path == "/_cluster/health" {
+			json.NewEncoder(w).Encode(map[string]string{"status": "green"})
+			return
+		}
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"hits": map[string]interface{}{
+				"total": map[string]interface{}{"value": 0},
+				"hits":  []interface{}{},
+			},
+		})
+	}))
+	defer mockES.Close()
+
+	esClient, err := elasticsearch.NewClient(mockES.URL)
+	if err != nil {
+		t.Fatalf("failed to create ES client: %v", err)
+	}
+
+	h := NewHandler(nil, esClient)
+
+	body := `{"query": "test", "index": "custom_idx", "page": 3, "per_page": 10}`
+	req := httptest.NewRequest("POST", "/search", bytes.NewBufferString(body))
+	w := httptest.NewRecorder()
+
+	h.Search(w, req)
+
+	resp := w.Result()
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("expected status 200, got %d", resp.StatusCode)
 	}
 }

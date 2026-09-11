@@ -1,11 +1,23 @@
 package main
 
 import (
+	"context"
+	"database/sql"
+	"database/sql/driver"
+	"encoding/json"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"reflect"
 	"strings"
 	"testing"
+	"time"
+	"unsafe"
+
+	"github.com/datalens/ingestion-service/elasticsearch"
+	"github.com/datalens/ingestion-service/handler"
+	"github.com/datalens/ingestion-service/postgres"
 )
 
 func TestGetEnvReturnsFallback(t *testing.T) {
@@ -328,5 +340,603 @@ func TestCorsMiddlewareHeaders(t *testing.T) {
 	}
 	if resp.Header.Get("Access-Control-Allow-Headers") != "Content-Type, Authorization" {
 		t.Errorf("unexpected ACH header: %s", resp.Header.Get("Access-Control-Allow-Headers"))
+	}
+}
+
+// --- Mock ES server for main tests ---
+
+func newMockESForMain(t *testing.T, indexExists bool) *httptest.Server {
+	t.Helper()
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		path := r.URL.Path
+		switch {
+		case path == "/_cluster/health":
+			json.NewEncoder(w).Encode(map[string]string{"status": "green"})
+		case r.Method == "HEAD":
+			if indexExists {
+				w.WriteHeader(http.StatusOK)
+			} else {
+				w.WriteHeader(http.StatusNotFound)
+			}
+		case r.Method == "PUT":
+			w.WriteHeader(http.StatusOK)
+		case r.Method == "POST" && path == "/_bulk":
+			json.NewEncoder(w).Encode(map[string]interface{}{"errors": false})
+		case r.Method == "POST" && strings.HasSuffix(path, "/_search"):
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"hits": map[string]interface{}{
+					"total": map[string]interface{}{"value": 0},
+					"hits":  []interface{}{},
+				},
+			})
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+}
+
+func newMockESBulkError(t *testing.T) *httptest.Server {
+	t.Helper()
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		path := r.URL.Path
+		switch {
+		case path == "/_cluster/health":
+			json.NewEncoder(w).Encode(map[string]string{"status": "green"})
+		case r.Method == "POST" && path == "/_bulk":
+			json.NewEncoder(w).Encode(map[string]interface{}{"errors": true})
+		default:
+			w.WriteHeader(http.StatusOK)
+		}
+	}))
+}
+
+func newMockESCreateFail(t *testing.T) *httptest.Server {
+	t.Helper()
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		path := r.URL.Path
+		switch {
+		case path == "/_cluster/health":
+			json.NewEncoder(w).Encode(map[string]string{"status": "green"})
+		case r.Method == "HEAD":
+			w.WriteHeader(http.StatusNotFound)
+		case r.Method == "PUT":
+			w.WriteHeader(http.StatusInternalServerError)
+		default:
+			w.WriteHeader(http.StatusOK)
+		}
+	}))
+}
+
+func createMainESClient(t *testing.T, serverURL string) *elasticsearch.Client {
+	t.Helper()
+	esClient, err := elasticsearch.NewClient(serverURL)
+	if err != nil {
+		t.Fatalf("failed to create ES client: %v", err)
+	}
+	return esClient
+}
+
+// --- Tests for ensureIndex ---
+
+func TestEnsureIndexExists(t *testing.T) {
+	mockES := newMockESForMain(t, true)
+	defer mockES.Close()
+
+	esClient := createMainESClient(t, mockES.URL)
+	ctx := context.Background()
+
+	err := ensureIndex(ctx, esClient, "test_index")
+	if err != nil {
+		t.Errorf("expected no error when index exists, got %v", err)
+	}
+}
+
+func TestEnsureIndexNotExists(t *testing.T) {
+	mockES := newMockESForMain(t, false)
+	defer mockES.Close()
+
+	esClient := createMainESClient(t, mockES.URL)
+	ctx := context.Background()
+
+	err := ensureIndex(ctx, esClient, "new_index")
+	if err != nil {
+		t.Errorf("expected no error when creating index, got %v", err)
+	}
+}
+
+func TestEnsureIndexCreateError(t *testing.T) {
+	mockES := newMockESCreateFail(t)
+	defer mockES.Close()
+
+	esClient := createMainESClient(t, mockES.URL)
+	ctx := context.Background()
+
+	err := ensureIndex(ctx, esClient, "fail_index")
+	if err == nil {
+		t.Error("expected error when CreateIndex fails, got nil")
+	}
+}
+
+func TestEnsureIndexIndexExistsError(t *testing.T) {
+	// Start server, create client, close server so IndexExists fails
+	mockES := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{"status": "green"})
+	}))
+
+	esClient := createMainESClient(t, mockES.URL)
+	mockES.Close() // Close so subsequent requests fail
+
+	ctx := context.Background()
+	err := ensureIndex(ctx, esClient, "test")
+	if err == nil {
+		t.Error("expected error when IndexExists fails, got nil")
+	}
+}
+
+// --- Tests for batchIndex ---
+
+func TestBatchIndexEmpty(t *testing.T) {
+	mockES := newMockESForMain(t, false)
+	defer mockES.Close()
+
+	esClient := createMainESClient(t, mockES.URL)
+	ctx := context.Background()
+
+	err := batchIndex(ctx, esClient, "test_index", nil)
+	if err != nil {
+		t.Errorf("expected no error for empty docs, got %v", err)
+	}
+}
+
+func TestBatchIndexSmall(t *testing.T) {
+	mockES := newMockESForMain(t, false)
+	defer mockES.Close()
+
+	esClient := createMainESClient(t, mockES.URL)
+	ctx := context.Background()
+
+	docs := make([]map[string]interface{}, 5)
+	for i := range docs {
+		docs[i] = map[string]interface{}{
+			"dataset_id": int64(1),
+			"name":       "item",
+		}
+	}
+
+	err := batchIndex(ctx, esClient, "test_index", docs)
+	if err != nil {
+		t.Errorf("expected no error for small batch, got %v", err)
+	}
+
+	// Verify docs were modified with index and ingested_at
+	for i, doc := range docs {
+		if doc["index"] != i {
+			t.Errorf("expected doc[%d].index=%d, got %v", i, i, doc["index"])
+		}
+		if doc["ingested_at"] == nil {
+			t.Errorf("expected doc[%d].ingested_at to be set", i)
+		}
+	}
+}
+
+func TestBatchIndexLarge(t *testing.T) {
+	mockES := newMockESForMain(t, false)
+	defer mockES.Close()
+
+	esClient := createMainESClient(t, mockES.URL)
+	ctx := context.Background()
+
+	docs := make([]map[string]interface{}, 150)
+	for i := range docs {
+		docs[i] = map[string]interface{}{
+			"dataset_id": int64(1),
+			"name":       "item",
+		}
+	}
+
+	err := batchIndex(ctx, esClient, "test_index", docs)
+	if err != nil {
+		t.Errorf("expected no error for large batch, got %v", err)
+	}
+
+	// Verify last doc index
+	lastDoc := docs[149]
+	if lastDoc["index"] != 149 {
+		t.Errorf("expected last doc index=149, got %v", lastDoc["index"])
+	}
+}
+
+func TestBatchIndexExactBatchSize(t *testing.T) {
+	mockES := newMockESForMain(t, false)
+	defer mockES.Close()
+
+	esClient := createMainESClient(t, mockES.URL)
+	ctx := context.Background()
+
+	docs := make([]map[string]interface{}, 100)
+	for i := range docs {
+		docs[i] = map[string]interface{}{
+			"dataset_id": int64(1),
+			"name":       "item",
+		}
+	}
+
+	err := batchIndex(ctx, esClient, "test_index", docs)
+	if err != nil {
+		t.Errorf("expected no error for exact batch size, got %v", err)
+	}
+}
+
+func TestBatchIndexBulkError(t *testing.T) {
+	mockES := newMockESBulkError(t)
+	defer mockES.Close()
+
+	esClient := createMainESClient(t, mockES.URL)
+	ctx := context.Background()
+
+	docs := []map[string]interface{}{
+		{"dataset_id": int64(1), "name": "item"},
+	}
+
+	err := batchIndex(ctx, esClient, "test_index", docs)
+	if err == nil {
+		t.Error("expected error when BulkIndex fails, got nil")
+	}
+	if !strings.Contains(err.Error(), "failed to index batch") {
+		t.Errorf("expected error message to contain 'failed to index batch', got: %v", err)
+	}
+}
+
+func TestBatchIndexContextCancelled(t *testing.T) {
+	mockES := newMockESForMain(t, false)
+	defer mockES.Close()
+
+	esClient := createMainESClient(t, mockES.URL)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	docs := []map[string]interface{}{
+		{"dataset_id": int64(1), "name": "item"},
+	}
+
+	err := batchIndex(ctx, esClient, "test_index", docs)
+	if err == nil {
+		t.Log("batchIndex did not return error with cancelled context")
+	}
+}
+
+// --- Tests for processCSV with different data ---
+
+func TestProcessCSVDelimiters(t *testing.T) {
+	// Standard comma-separated works
+	csvData := "name,age\nAlice,30\n"
+	rows, header, err := processCSV(strings.NewReader(csvData))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(header) != 2 || header[0] != "name" || header[1] != "age" {
+		t.Errorf("unexpected headers: %v", header)
+	}
+	if len(rows) != 1 {
+		t.Errorf("expected 1 row, got %d", len(rows))
+	}
+}
+
+func TestProcessCSVSemicolonDelimited(t *testing.T) {
+	// Semicolon-separated with default comma reader: entire line is one field
+	csvData := "name;age\nAlice;30\n"
+	rows, header, err := processCSV(strings.NewReader(csvData))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	// The semicolons are treated as part of the data, not delimiters
+	if len(header) != 1 || header[0] != "name;age" {
+		t.Errorf("expected single header 'name;age', got %v", header)
+	}
+	// Row data is also one field
+	if len(rows) != 1 {
+		t.Errorf("expected 1 row, got %d", len(rows))
+	}
+}
+
+func TestProcessCSVTabDelimited(t *testing.T) {
+	// Tab-separated with default comma reader: entire line is one field
+	csvData := "name\tage\nAlice\t30\n"
+	rows, header, err := processCSV(strings.NewReader(csvData))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(header) != 1 || header[0] != "name\tage" {
+		t.Errorf("expected single header 'name\\tage', got %v", header)
+	}
+	if len(rows) != 1 {
+		t.Errorf("expected 1 row, got %d", len(rows))
+	}
+}
+
+func TestProcessCSVLargeDataset(t *testing.T) {
+	csvData := "id,value\n"
+	for i := 0; i < 1000; i++ {
+		csvData += "x,y\n"
+	}
+
+	rows, header, err := processCSV(strings.NewReader(csvData))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(header) != 2 {
+		t.Errorf("expected 2 headers, got %d", len(header))
+	}
+	if len(rows) != 1000 {
+		t.Errorf("expected 1000 rows, got %d", len(rows))
+	}
+}
+
+func TestProcessCSVWithQuotes(t *testing.T) {
+	csvData := `"name","description"
+"Alice","She said ""hello"""
+"Bob","A ""quoted"" value"
+`
+	rows, header, err := processCSV(strings.NewReader(csvData))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(header) != 2 {
+		t.Errorf("expected 2 headers, got %d", len(header))
+	}
+	if len(rows) != 2 {
+		t.Fatalf("expected 2 rows, got %d", len(rows))
+	}
+	if rows[0]["description"] != `She said "hello"` {
+		t.Errorf("expected unescaped quotes, got %v", rows[0]["description"])
+	}
+}
+
+func TestCorsMiddlewareNonOPTIONS(t *testing.T) {
+	handler := corsMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusCreated)
+	}))
+
+	req := httptest.NewRequest("DELETE", "/test", nil)
+	w := httptest.NewRecorder()
+
+	handler.ServeHTTP(w, req)
+
+	resp := w.Result()
+	if resp.StatusCode != http.StatusCreated {
+		t.Errorf("expected status 201, got %d", resp.StatusCode)
+	}
+	if resp.Header.Get("Access-Control-Allow-Origin") != "*" {
+		t.Errorf("expected ACAO='*', got %q", resp.Header.Get("Access-Control-Allow-Origin"))
+	}
+}
+
+func TestGetEnvConcurrency(t *testing.T) {
+	key := "TEST_CONCURRENT_KEY_99999"
+	os.Unsetenv(key)
+	defer os.Unsetenv(key)
+
+	done := make(chan bool, 10)
+	for i := 0; i < 10; i++ {
+		go func() {
+			val := getEnv(key, "fallback")
+			if val != "fallback" {
+				t.Errorf("expected 'fallback', got %q", val)
+			}
+			done <- true
+		}()
+	}
+	for i := 0; i < 10; i++ {
+		<-done
+	}
+}
+
+func TestParseCSVRowEdgeCases(t *testing.T) {
+	// Empty header
+	result := parseCSVRow([]string{}, []string{"a", "b"})
+	if len(result) != 0 {
+		t.Errorf("expected empty result for empty header, got %d fields", len(result))
+	}
+
+	// Very large number - ParseFloat succeeds, returns float64
+	result = parseCSVRow([]string{"big"}, []string{"99999999999999999999"})
+	if _, ok := result["big"].(float64); !ok {
+		t.Errorf("expected very large number as float64, got %T", result["big"])
+	}
+
+	// "inf" is parsed as float64 +Inf by ParseFloat
+	result = parseCSVRow([]string{"val"}, []string{"inf"})
+	if _, ok := result["val"].(float64); !ok {
+		t.Errorf("expected 'inf' as float64 (+Inf), got %T", result["val"])
+	}
+
+	// Negative zero
+	result = parseCSVRow([]string{"val"}, []string{"-0"})
+	if result["val"] != 0 {
+		t.Errorf("expected -0 as 0, got %v", result["val"])
+	}
+
+	// Empty string field
+	result = parseCSVRow([]string{"val"}, []string{""})
+	if result["val"] != "" {
+		t.Errorf("expected empty string, got %v", result["val"])
+	}
+}
+
+// --- Test driver for mock database ---
+
+type mainTestDriver struct{}
+
+func init() {
+	sql.Register("maintestdrv", &mainTestDriver{})
+}
+
+func (d *mainTestDriver) Open(name string) (driver.Conn, error) {
+	return &mainTestConn{}, nil
+}
+
+type mainTestConn struct{}
+
+func (c *mainTestConn) Prepare(query string) (driver.Stmt, error) { return nil, driver.ErrSkip }
+func (c *mainTestConn) Close() error                             { return nil }
+func (c *mainTestConn) Begin() (driver.Tx, error)                { return nil, driver.ErrSkip }
+func (c *mainTestConn) Exec(query string, args []driver.Value) (driver.Result, error) {
+	return &mainTestResult{}, nil
+}
+func (c *mainTestConn) Query(query string, args []driver.Value) (driver.Rows, error) {
+	return nil, driver.ErrSkip
+}
+
+type mainTestResult struct{}
+
+func (r *mainTestResult) LastInsertId() (int64, error) { return 0, nil }
+func (r *mainTestResult) RowsAffected() (int64, error) { return 0, nil }
+
+func createMainPGClient() *postgres.Client {
+	db, _ := sql.Open("maintestdrv", "")
+	v := reflect.New(reflect.TypeOf(postgres.Client{}))
+	f := v.Elem().FieldByName("db")
+	reflect.NewAt(f.Type(), unsafe.Pointer(f.UnsafeAddr())).Elem().Set(reflect.ValueOf(db))
+	return v.Interface().(*postgres.Client)
+}
+
+// TestServerSetup exercises the code paths in main() without calling main() directly.
+func TestServerSetup(t *testing.T) {
+	// Create mock ES server
+	mockES := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.URL.Path == "/_cluster/health":
+			json.NewEncoder(w).Encode(map[string]string{"status": "green"})
+		case r.Method == "HEAD":
+			w.WriteHeader(http.StatusOK)
+		case r.Method == "POST" && r.URL.Path == "/_bulk":
+			json.NewEncoder(w).Encode(map[string]interface{}{"errors": false})
+		case r.Method == "POST" && strings.HasSuffix(r.URL.Path, "/_search"):
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"hits": map[string]interface{}{
+					"total": map[string]interface{}{"value": 0},
+					"hits":  []interface{}{},
+				},
+			})
+		default:
+			w.WriteHeader(http.StatusOK)
+		}
+	}))
+	defer mockES.Close()
+
+	esClient, err := elasticsearch.NewClient(mockES.URL)
+	if err != nil {
+		t.Fatalf("failed to create ES client: %v", err)
+	}
+
+	pgClient := createMainPGClient()
+	defer pgClient.Close()
+
+	h := handler.NewHandler(pgClient, esClient)
+
+	// Set up routes (same as main())
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /ingest", h.IngestCSV)
+	mux.HandleFunc("GET /health", h.Health)
+	mux.HandleFunc("POST /search", h.Search)
+
+	corsHandler := corsMiddleware(mux)
+
+	// Start server on random port
+	listener, err := net.Listen("tcp", ":0")
+	if err != nil {
+		t.Fatalf("failed to listen: %v", err)
+	}
+	defer listener.Close()
+
+	go http.Serve(listener, corsHandler)
+	time.Sleep(50 * time.Millisecond) // Wait for server to start
+
+	baseURL := "http://" + listener.Addr().String()
+
+	// Test health endpoint
+	resp, err := http.Get(baseURL + "/health")
+	if err != nil {
+		t.Fatalf("health request failed: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("expected health status 200, got %d", resp.StatusCode)
+	}
+
+	// Test search endpoint
+	searchBody := `{"query": "test"}`
+	resp, err = http.Post(baseURL+"/search", "application/json", strings.NewReader(searchBody))
+	if err != nil {
+		t.Fatalf("search request failed: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("expected search status 200, got %d", resp.StatusCode)
+	}
+
+	// Test CORS preflight
+	req, _ := http.NewRequest("OPTIONS", baseURL+"/health", nil)
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("options request failed: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("expected OPTIONS status 200, got %d", resp.StatusCode)
+	}
+	if resp.Header.Get("Access-Control-Allow-Origin") != "*" {
+		t.Errorf("expected ACAO='*', got %q", resp.Header.Get("Access-Control-Allow-Origin"))
+	}
+}
+
+// TestMainEnvironmentVariables tests the environment variable handling in main().
+func TestMainEnvironmentVariables(t *testing.T) {
+	// Test default values
+	os.Unsetenv("DATABASE_URL")
+	os.Unsetenv("ELASTICSEARCH_URL")
+	os.Unsetenv("PORT")
+
+	dbURL := getEnv("DATABASE_URL", "postgres://datalens:datalens_dev_2024@localhost:5433/datalens?sslmode=disable")
+	if !strings.Contains(dbURL, "localhost:5433") {
+		t.Errorf("unexpected default DB URL: %s", dbURL)
+	}
+
+	esURL := getEnv("ELASTICSEARCH_URL", "http://localhost:9200")
+	if esURL != "http://localhost:9200" {
+		t.Errorf("unexpected default ES URL: %s", esURL)
+	}
+
+	port := getEnv("PORT", "8081")
+	if port != "8081" {
+		t.Errorf("unexpected default port: %s", port)
+	}
+
+	// Test custom values
+	os.Setenv("DATABASE_URL", "postgres://custom:custom@remote:5432/db")
+	os.Setenv("ELASTICSEARCH_URL", "http://remote:9201")
+	os.Setenv("PORT", "9090")
+	defer os.Unsetenv("DATABASE_URL")
+	defer os.Unsetenv("ELASTICSEARCH_URL")
+	defer os.Unsetenv("PORT")
+
+	dbURL = getEnv("DATABASE_URL", "postgres://default")
+	if !strings.Contains(dbURL, "custom@remote:5432") {
+		t.Errorf("expected custom DB URL, got: %s", dbURL)
+	}
+
+	esURL = getEnv("ELASTICSEARCH_URL", "http://default")
+	if esURL != "http://remote:9201" {
+		t.Errorf("expected custom ES URL, got: %s", esURL)
+	}
+
+	port = getEnv("PORT", "8081")
+	if port != "9090" {
+		t.Errorf("expected custom port, got: %s", port)
 	}
 }

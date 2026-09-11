@@ -145,10 +145,10 @@ python analytics_job.py /path/to/dataset.csv 1
 
 | Service | Language | Tests | Line Coverage | Notes |
 |---------|----------|-------|---------------|-------|
-| API Gateway | Java | 16 | **50.9%** | 100% on SecurityConfig, 61% on security, 37% on service |
-| Ingestion Service | Go | 50 | **60.0%** | 87.8% on ES client, 100% on CSV parsing |
-| Frontend | TypeScript | 59 | **59%** statements | 100% on auth slice, App, Layout, Dashboard |
-| **Total** | | **125** | | |
+| API Gateway | Java | 58 | **96.5%** | 100% on security, controllers, config |
+| Ingestion Service | Go | 98 | **88.7%** | 95% handler, 93% postgres, 94% ES |
+| Frontend | TypeScript | 127 | **90.8%** statements | 100% on slices, api client, store |
+| **Total** | | **283** | | |
 
 ## Project Structure
 
