@@ -35,3 +35,8 @@ uploads/
 
 # Logs
 *.log
+
+# Coverage reports
+frontend/coverage/
+ingestion-service/coverage.out
+ingestion-service/coverage.html

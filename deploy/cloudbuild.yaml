@@ -1,0 +1,184 @@
+# =============================================================================
+# DataLens — Google Cloud Build CI/CD Pipeline
+#
+# Builds all three service images, pushes to Google Container Registry,
+# and deploys to Cloud Run.
+#
+# Trigger: Push to main branch or manual trigger
+# =============================================================================
+
+steps:
+  # -------------------------------------------------------------------------
+  # Step 1: Build API Gateway (Java Spring Boot)
+  # -------------------------------------------------------------------------
+  - name: gcr.io/cloud-builders/docker
+    id: build-api-gateway
+    args:
+      - build
+      - -t
+      - gcr.io/$PROJECT_ID/datalens-api-gateway:$COMMIT_SHA
+      - -t
+      - gcr.io/$PROJECT_ID/datalens-api-gateway:latest
+      - -f
+      - api-gateway/Dockerfile
+      - api-gateway/
+    timeout: 600s
+
+  # -------------------------------------------------------------------------
+  # Step 2: Build Ingestion Service (Go)
+  # -------------------------------------------------------------------------
+  - name: gcr.io/cloud-builders/docker
+    id: build-ingestion-service
+    args:
+      - build
+      - -t
+      - gcr.io/$PROJECT_ID/datalens-ingestion-service:$COMMIT_SHA
+      - -t
+      - gcr.io/$PROJECT_ID/datalens-ingestion-service:latest
+      - -f
+      - ingestion-service/Dockerfile
+      - ingestion-service/
+    timeout: 300s
+
+  # -------------------------------------------------------------------------
+  # Step 3: Build Frontend (React + Nginx)
+  # -------------------------------------------------------------------------
+  - name: gcr.io/cloud-builders/docker
+    id: build-frontend
+    args:
+      - build
+      - -t
+      - gcr.io/$PROJECT_ID/datalens-frontend:$COMMIT_SHA
+      - -t
+      - gcr.io/$PROJECT_ID/datalens-frontend:latest
+      - -f
+      - frontend/Dockerfile
+      - frontend/
+    timeout: 300s
+
+  # -------------------------------------------------------------------------
+  # Step 4: Push all images to GCR
+  # -------------------------------------------------------------------------
+  - name: gcr.io/cloud-builders/docker
+    id: push-images
+    args:
+      - push
+      - --all-tags
+    wait_for:
+      - build-api-gateway
+      - build-ingestion-service
+      - build-frontend
+
+  # -------------------------------------------------------------------------
+  # Step 5: Deploy API Gateway to Cloud Run
+  # -------------------------------------------------------------------------
+  - name: gcr.io/google.com/cloudsdktool/cloud-sdk
+    id: deploy-api-gateway
+    entrypoint: gcloud
+    args:
+      - run
+      - deploy
+      - datalens-api-gateway
+      - --image=gcr.io/$PROJECT_ID/datalens-api-gateway:$COMMIT_SHA
+      - --region=us-central1
+      - --platform=managed
+      - --allow-unauthenticated
+      - --min-instances=0
+      - --max-instances=3
+      - --cpu=0.5
+      - --memory=512Mi
+      - --port=8080
+      - --set-env-vars=^:^DB_URL=${_DB_URL}:ELASTICSEARCH_URL=${_ELASTICSEARCH_URL}:JWT_SECRET=${_JWT_SECRET}
+      - --quiet
+    wait_for:
+      - push-images
+
+  # -------------------------------------------------------------------------
+  # Step 6: Deploy Ingestion Service to Cloud Run
+  # -------------------------------------------------------------------------
+  - name: gcr.io/google.com/cloudsdktool/cloud-sdk
+    id: deploy-ingestion-service
+    entrypoint: gcloud
+    args:
+      - run
+      - deploy
+      - datalens-ingestion-service
+      - --image=gcr.io/$PROJECT_ID/datalens-ingestion-service:$COMMIT_SHA
+      - --region=us-central1
+      - --platform=managed
+      - --allow-unauthenticated
+      - --min-instances=0
+      - --max-instances=3
+      - --cpu=0.5
+      - --memory=512Mi
+      - --port=8081
+      - --set-env-vars=^:^DB_URL=${_DB_URL}:ELASTICSEARCH_URL=${_ELASTICSEARCH_URL}
+      - --quiet
+    wait_for:
+      - push-images
+
+  # -------------------------------------------------------------------------
+  # Step 7: Deploy Frontend to Cloud Run
+  # -------------------------------------------------------------------------
+  # Note: Frontend nginx.conf needs the actual API Gateway URL.
+  # In production, you'd substitute it via templating or env injection.
+  - name: gcr.io/google.com/cloudsdktool/cloud-sdk
+    id: deploy-frontend
+    entrypoint: bash
+    args:
+      - -c
+      - |
+        # Get API Gateway URL from deployed service
+        API_URL=$$(gcloud run services describe datalens-api-gateway \
+          --region=us-central1 \
+          --format='value(status.url)' 2>/dev/null || echo "http://localhost:8080")
+
+        # Patch nginx.conf with the actual API Gateway URL
+        sed -i "s|http://API_GATEWAY_URL:8080|$${API_URL}|g" frontend/nginx.conf
+
+        # Rebuild and deploy
+        docker build \
+          -t gcr.io/$$PROJECT_ID/datalens-frontend:$$COMMIT_SHA \
+          -t gcr.io/$$PROJECT_ID/datalens-frontend:latest \
+          -f frontend/Dockerfile \
+          frontend/
+        docker push --all-tags gcr.io/$$PROJECT_ID/datalens-frontend
+
+        gcloud run deploy datalens-frontend \
+          --image=gcr.io/$$PROJECT_ID/datalens-frontend:$$COMMIT_SHA \
+          --region=us-central1 \
+          --platform=managed \
+          --allow-unauthenticated \
+          --min-instances=0 \
+          --max-instances=3 \
+          --cpu=0.5 \
+          --memory=512Mi \
+          --port=80 \
+          --quiet
+    wait_for:
+      - push-images
+
+# ---------------------------------------------------------------------------
+# Substitution variables (set in Cloud Build trigger or via CLI)
+# ---------------------------------------------------------------------------
+substitutions:
+  _DB_URL: "postgres://user:password@localhost:5432/datalens"
+  _ELASTICSEARCH_URL: "http://localhost:9200"
+  _JWT_SECRET: "change-me-in-production"
+
+# ---------------------------------------------------------------------------
+# Build options
+# ---------------------------------------------------------------------------
+options:
+  logging: CLOUD_LOGGING_ONLY
+  machineType: E2_HIGHCPU_8
+
+timeout: 1800s  # 30 minute overall timeout
+
+images:
+  - gcr.io/$PROJECT_ID/datalens-api-gateway:$COMMIT_SHA
+  - gcr.io/$PROJECT_ID/datalens-api-gateway:latest
+  - gcr.io/$PROJECT_ID/datalens-ingestion-service:$COMMIT_SHA
+  - gcr.io/$PROJECT_ID/datalens-ingestion-service:latest
+  - gcr.io/$PROJECT_ID/datalens-frontend:$COMMIT_SHA
+  - gcr.io/$PROJECT_ID/datalens-frontend:latest
