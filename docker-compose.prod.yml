@@ -1,5 +1,3 @@
-version: '3.8'
-
 # Production docker-compose — replaces docker-compose.yml (dev infra)
 # Usage:
 #   cp .env.example .env   # fill in real credentials

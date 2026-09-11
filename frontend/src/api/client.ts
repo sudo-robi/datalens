@@ -1,15 +1,9 @@
 import axios from 'axios'
 
 const API_BASE = import.meta.env.VITE_API_URL || '/api'
-const INGESTION_BASE = import.meta.env.VITE_INGESTION_URL || 'http://localhost:8081'
 
 export const api = axios.create({
   baseURL: API_BASE,
-  timeout: 10000,
-})
-
-export const ingestionApi = axios.create({
-  baseURL: INGESTION_BASE,
   timeout: 10000,
 })
 

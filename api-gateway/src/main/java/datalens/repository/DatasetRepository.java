@@ -6,5 +6,4 @@ import java.util.List;
 
 public interface DatasetRepository extends JpaRepository<Dataset, Long> {
     List<Dataset> findByUserIdOrderByCreatedAtDesc(Long userId);
-    List<Dataset> findByUserIdAndNameContainingIgnoreCase(Long userId, String name);
 }

@@ -90,11 +90,4 @@ public class DatasetService {
 
         datasetRepository.delete(dataset);
     }
-
-    public void updateRowCount(Long datasetId, Long rowCount) {
-        datasetRepository.findById(datasetId).ifPresent(dataset -> {
-            dataset.setRowCount(rowCount);
-            datasetRepository.save(dataset);
-        });
-    }
 }

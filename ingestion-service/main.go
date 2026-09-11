@@ -70,7 +70,6 @@ func getEnv(key, fallback string) string {
 	return fallback
 }
 
-// parseCSVRow parses a CSV row into a map using the header
 func parseCSVRow(header []string, row []string) map[string]interface{} {
 	result := make(map[string]interface{})
 	for i, field := range header {
@@ -88,10 +87,8 @@ func parseCSVRow(header []string, row []string) map[string]interface{} {
 	return result
 }
 
-// processCSV is a helper that reads CSV and returns rows as maps
 func processCSV(reader io.Reader) ([]map[string]interface{}, []string, error) {
 	csvReader := csv.NewReader(reader)
-
 	header, err := csvReader.Read()
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to read CSV header: %w", err)
@@ -108,11 +105,9 @@ func processCSV(reader io.Reader) ([]map[string]interface{}, []string, error) {
 		}
 		rows = append(rows, parseCSVRow(header, row))
 	}
-
 	return rows, header, nil
 }
 
-// ensureIndex creates the Elasticsearch index if it doesn't exist
 func ensureIndex(ctx context.Context, es *elasticsearch.Client, indexName string) error {
 	exists, err := es.IndexExists(ctx, indexName)
 	if err != nil {
@@ -124,7 +119,6 @@ func ensureIndex(ctx context.Context, es *elasticsearch.Client, indexName string
 	return nil
 }
 
-// batchIndex indexes documents in batches for better performance
 func batchIndex(ctx context.Context, es *elasticsearch.Client, indexName string, docs []map[string]interface{}) error {
 	const batchSize = 100
 	for i := 0; i < len(docs); i += batchSize {
@@ -133,12 +127,10 @@ func batchIndex(ctx context.Context, es *elasticsearch.Client, indexName string,
 			end = len(docs)
 		}
 		batch := docs[i:end]
-
 		for j, doc := range batch {
 			doc["index"] = i + j
 			doc["ingested_at"] = time.Now().UTC()
 		}
-
 		if err := es.BulkIndex(ctx, indexName, batch); err != nil {
 			return fmt.Errorf("failed to index batch at offset %d: %w", i, err)
 		}

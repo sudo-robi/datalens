@@ -143,12 +143,12 @@ python analytics_job.py /path/to/dataset.csv 1
 
 ## Test Coverage
 
-| Service | Language | Tests | Line Coverage | Notes |
-|---------|----------|-------|---------------|-------|
-| API Gateway | Java | 58 | **96.5%** | 100% on security, controllers, config |
-| Ingestion Service | Go | 98 | **88.7%** | 95% handler, 93% postgres, 94% ES |
-| Frontend | TypeScript | 127 | **90.8%** statements | 100% on slices, api client, store |
-| **Total** | | **283** | | |
+| Service | Language | Test Files | Line Coverage | Notes |
+|---------|----------|------------|---------------|-------|
+| API Gateway | Java | 13 | **96.4%** | 100% security, controllers, config |
+| Ingestion Service | Go | 4 | **88.7%** | 95% handler, 93% postgres, 94% ES |
+| Frontend | TypeScript | 13 | **90.7%** statements | 100% slices, api client, store |
+| **Total** | | **30** | | |
 
 ## Project Structure
 

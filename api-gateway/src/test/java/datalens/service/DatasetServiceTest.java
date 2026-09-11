@@ -186,23 +186,4 @@ class DatasetServiceTest {
         assertThrows(RuntimeException.class, () ->
                 datasetService.deleteDataset("testuser", 999L));
     }
-
-    @Test
-    void updateRowCountUpdatesExistingDataset() {
-        when(datasetRepository.findById(10L)).thenReturn(Optional.of(testDataset));
-
-        datasetService.updateRowCount(10L, 500L);
-
-        assertEquals(500L, testDataset.getRowCount());
-        verify(datasetRepository).save(testDataset);
-    }
-
-    @Test
-    void updateRowCountDoesNothingForNonExistentDataset() {
-        when(datasetRepository.findById(999L)).thenReturn(Optional.empty());
-
-        datasetService.updateRowCount(999L, 500L);
-
-        verify(datasetRepository, never()).save(any());
-    }
 }

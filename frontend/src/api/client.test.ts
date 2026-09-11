@@ -15,11 +15,6 @@ describe('api client', () => {
     expect(api.defaults.baseURL).toBeDefined()
   })
 
-  it('ingestionApi has correct baseURL', async () => {
-    const { ingestionApi } = await import('./client')
-    expect(ingestionApi.defaults.baseURL).toBeDefined()
-  })
-
   it('api request interceptor adds Authorization header when token exists', async () => {
     const { api } = await import('./client')
     localStorage.setItem('token', 'test-token-123')
