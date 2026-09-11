@@ -16,7 +16,7 @@ jobs:
           distribution: temurin
           java-version: '21'
       - name: Build and test API Gateway
-        run: ./gradlew test jacocoTestReport
+        run: ./gradlew test jacocoTestReport --no-daemon
         working-directory: api-gateway
       - name: Upload Java coverage
         uses: actions/upload-artifact@v4

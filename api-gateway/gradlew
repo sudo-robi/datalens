@@ -7,11 +7,10 @@ GRADLE_BIN="$GRADLE_HOME/gradle-$GRADLE_VERSION/bin/gradle"
 if [ ! -f "$GRADLE_BIN" ]; then
     echo "Downloading Gradle $GRADLE_VERSION..."
     mkdir -p "$GRADLE_HOME"
-    cd /tmp
-    curl -sL "https://services.gradle.org/distributions/gradle-${GRADLE_VERSION}-bin.zip" -o gradle.zip
-    unzip -q gradle.zip -d "$GRADLE_HOME"
-    rm gradle.zip
+    TMPDIR=$(mktemp -d)
+    curl -sL "https://services.gradle.org/distributions/gradle-${GRADLE_VERSION}-bin.zip" -o "$TMPDIR/gradle.zip"
+    unzip -q "$TMPDIR/gradle.zip" -d "$GRADLE_HOME"
+    rm -rf "$TMPDIR"
 fi
 
-cd "$(dirname "$0")"
 exec "$GRADLE_BIN" "$@"
