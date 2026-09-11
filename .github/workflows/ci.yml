@@ -9,9 +9,6 @@ on:
 jobs:
   java-tests:
     runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: api-gateway
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-java@v4
@@ -20,6 +17,7 @@ jobs:
           java-version: '21'
       - name: Build and test API Gateway
         run: ./gradlew test jacocoTestReport
+        working-directory: api-gateway
       - name: Upload Java coverage
         uses: actions/upload-artifact@v4
         if: always()
@@ -29,16 +27,13 @@ jobs:
 
   go-tests:
     runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: ingestion-service
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
           go-version: '1.22'
       - name: Run Go tests
-        run: go test -coverprofile=coverage.out -covermode=atomic ./...
+        run: cd ingestion-service && go test -coverprofile=coverage.out -covermode=atomic ./...
       - name: Upload Go coverage
         uses: actions/upload-artifact@v4
         if: always()
@@ -48,9 +43,6 @@ jobs:
 
   frontend-tests:
     runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: frontend
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -58,10 +50,8 @@ jobs:
           node-version: '20'
           cache: npm
           cache-dependency-path: frontend/package-lock.json
-      - name: Install dependencies
-        run: npm ci
-      - name: Run frontend tests
-        run: npx vitest run --coverage
+      - name: Install and test frontend
+        run: cd frontend && npm ci && npx vitest run --coverage
 
   build-images:
     needs: [java-tests, go-tests, frontend-tests]
